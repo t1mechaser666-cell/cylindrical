@@ -1,0 +1,384 @@
+RENO: Real-Time Neural Compression for 3D LiDAR Point Clouds
+
+我想要在这篇论文的基础上进行改进，然后完成我的博士生论文，并发表一篇SCI一区。
+我现在主要想聚焦在保证实时性的前提下进行单帧的压缩，暂时不考虑时间相关性。
+我现在有一个思路，请你先帮我进行可行性分析。
+一般来说，输入到网络的点云信息是坐标，这些坐标都是在XYZ笛卡尔坐标系下面的，我想要在原有的方法上修改数据的坐标系。
+以下是论文源代码的主要代码。
+network.py
+import torch
+import torch.nn as nn
+
+import torchsparse
+from torchsparse import nn as spnn
+from torchsparse import SparseTensor
+
+import kit.op as op
+from kit.nn import ResNet, FOG, FCG, TargetEmbedding
+
+class Network(nn.Module):
+    def __init__(self, channels, kernel_size):
+        super(Network, self).__init__()
+
+        self.prior_embedding = nn.Embedding(256, channels)
+
+        self.prior_resnet = nn.Sequential(
+            spnn.Conv3d(channels, channels, kernel_size),
+            spnn.ReLU(True),
+            ResNet(channels, k=kernel_size),
+            ResNet(channels, k=kernel_size),
+        )
+        
+        ###########################
+
+        self.target_embedding = TargetEmbedding(channels)
+
+        self.target_resnet = nn.Sequential(
+            spnn.Conv3d(channels, channels, kernel_size),
+            spnn.ReLU(True),
+            ResNet(channels, k=kernel_size),
+            ResNet(channels, k=kernel_size),
+        )
+
+        ###########################
+
+        self.pred_head_s0 = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.ReLU(True),
+            nn.Linear(channels, 16),
+            nn.Softmax(dim=-1),
+        )
+
+        self.pred_head_s1_emb = nn.Embedding(16, channels)
+        self.pred_head_s1 = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.ReLU(True),
+            nn.Linear(channels, 16),
+            nn.Softmax(dim=-1),
+        )
+
+        self.channels = channels
+        self.fog = FOG()
+        self.fcg = FCG()
+
+    def forward(self, x):
+        N = x.coords.shape[0]
+
+        # get sparse occupancy code list
+        data_ls = []
+        while True:
+            x = self.fog(x)
+            data_ls.append((x.coords.clone(), x.feats.clone())) # must clone
+            if x.coords.shape[0] < 64:
+                break
+        data_ls = data_ls[::-1]
+        # data_ls: [(coords, occupancy), (coords, occupancy), ...]
+
+        total_bits = 0
+        
+        for depth in range(len(data_ls)-1):
+            x_C, x_O = data_ls[depth]
+            gt_x_up_C, gt_x_up_O = data_ls[depth+1]
+            gt_x_up_C, gt_x_up_O = op.sort_CF(gt_x_up_C, gt_x_up_O)
+
+            # embedding prior scale feats
+            x_F = self.prior_embedding(x_O.int()).view(-1, self.channels) # (N_d, C)
+            x = SparseTensor(coords=x_C, feats=x_F)
+            x = self.prior_resnet(x) # (N_d, C) 
+
+            # target embedding
+            x_up_C, x_up_F = self.fcg(x_C, x_O, x.feats)
+            x_up_C, x_up_F = op.sort_CF(x_up_C, x_up_F)
+
+            x_up_F = self.target_embedding(x_up_F, x_up_C)
+            x_up = SparseTensor(coords=x_up_C, feats=x_up_F)
+            x_up = self.target_resnet(x_up)
+
+            # bit-wise two-stage coding
+            gt_x_up_O_s0 = torch.remainder(gt_x_up_O, 16) # 8-4-2-1
+            gt_x_up_O_s1 = torch.div(gt_x_up_O, 16, rounding_mode='floor') # 128-64-32-16
+
+            x_up_O_prob_s0 = self.pred_head_s0(x_up.feats) # (B*Nt, 256)
+            x_up_O_prob_s1 = self.pred_head_s1(x_up.feats + self.pred_head_s1_emb(gt_x_up_O_s0[:, 0].long())) # (B*Nt, 256)
+
+            x_up_O_prob_s0 = x_up_O_prob_s0.gather(1, gt_x_up_O_s0.long()) # (B*Nt, 1)
+            x_up_O_prob_s1 = x_up_O_prob_s1.gather(1, gt_x_up_O_s1.long()) # (B*Nt, 1)
+
+            total_bits += torch.sum(torch.clamp(-1.0 * torch.log2(x_up_O_prob_s0 + 1e-10), 0, 50))
+            total_bits += torch.sum(torch.clamp(-1.0 * torch.log2(x_up_O_prob_s1 + 1e-10), 0, 50))
+            
+        bpp = total_bits / N
+
+        return bpp
+
+train.py
+import os
+import random
+import argparse
+import datetime
+
+import numpy as np
+from glob import glob
+
+import torch
+import torch.utils.data
+from torch import nn
+from torch.cuda import amp
+from tqdm import tqdm
+from torchsparse.nn import functional as F
+from torchsparse.utils.collate import sparse_collate_fn
+
+from origcode.dataset import PCDataset
+from network import Network
+
+seed = 11
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+
+device='cuda:0'
+
+# set torchsparse config
+conv_config = F.conv_config.get_default_conv_config()
+conv_config.kmap_mode = "hashmap"
+F.conv_config.set_global_conv_config(conv_config)
+
+parser = argparse.ArgumentParser(
+    prog='train.py',
+    description='Training from scratch.',
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter
+)
+#/root/Dataset/KITTI_detection/training/velodyne/*.ply
+parser.add_argument('--training_data', default='/home/zyn/pccdata/SemanticKITTI/data_odometry_velodyne/dataset/sequences/**/*.bin', help='Training data (Glob pattern).')
+parser.add_argument('--model_save_folder', default='./model/Orig', help='Directory where to save trained models.')
+parser.add_argument("--is_data_pre_quantized", type=bool, default=False, help="Whether the training data is pre quantized.")
+parser.add_argument("--valid_samples", type=str, default='', help="Something like train.txt/val.txt.")
+
+parser.add_argument('--channels', type=int, help='Neural network channels.', default=32)
+parser.add_argument('--kernel_size', type=int, help='Convolution kernel size.', default=3)
+
+parser.add_argument('--batch_size', type=int, help='Batch size.', default=4)
+parser.add_argument('--learning_rate', type=float, help='Learning rate.', default=0.0005)
+parser.add_argument('--lr_decay', type=float, help='Decays the learning rate to x times the original.', default=0.1)
+parser.add_argument('--lr_decay_steps', help='Decays the learning rate at x steps.', default=[100000, 150000])
+parser.add_argument('--max_steps', type=int, help='Train up to this number of steps.', default=200000)
+
+args = parser.parse_args()
+
+# CREATE MODEL SAVE PATH
+os.makedirs(args.model_save_folder, exist_ok=True)
+
+files = np.array(glob(args.training_data, recursive=True))
+
+# check training samples
+if args.valid_samples != '':
+    valid_sample_names = np.loadtxt(args.valid_samples, dtype=str)
+    valid_files = []
+    for f in files:
+        fname = f.split('/')[-1].split('.')[0]
+        if fname in valid_sample_names:
+            valid_files.append(f)
+    files = valid_files
+
+np.random.shuffle(files)
+files = files[:]
+
+dataflow = torch.utils.data.DataLoader(
+    dataset=PCDataset(files, is_pre_quantized=args.is_data_pre_quantized),
+    shuffle=True,
+    batch_size=args.batch_size,
+    collate_fn=sparse_collate_fn
+)
+
+net = Network(channels=args.channels, kernel_size=args.kernel_size).to(device).train()
+optimizer = torch.optim.Adam(net.parameters(), lr=args.learning_rate)
+
+losses = []
+global_step = 0
+for epoch in range(1, 9999):
+    print(datetime.datetime.now())
+
+    pbar = tqdm(dataflow, desc=f"Epoch {epoch}", unit="it")
+    
+    for data in pbar :
+        x = data['input'].to(device=device)
+        
+        optimizer.zero_grad()
+        loss = net(x)
+
+        loss.backward()
+        optimizer.step()
+        global_step += 1
+
+        # PRINT
+        losses.append(loss.item())
+
+        if global_step % 500 == 0:
+            print(f'Epoch:{epoch} | Step:{global_step} | Loss:{round(np.array(losses).mean(), 5)}')
+            losses = []
+
+         # LEARNING RATE DECAY
+        if global_step in args.lr_decay_steps:
+            args.learning_rate = args.learning_rate * args.lr_decay
+            for g in optimizer.param_groups:
+                g['lr'] = args.learning_rate
+            print(f'Learning rate decay triggered at step {global_step}, LR is setting to {args.learning_rate}.')
+
+        # SAVE MODEL
+        if global_step % 500 == 0:
+            torch.save(net.state_dict(), os.path.join(args.model_save_folder, 'ckpt.pt'))
+        
+        if global_step >= args.max_steps:
+            break
+
+    if global_step >= args.max_steps:
+        break
+
+dataset.py
+import torch
+from torchsparse import SparseTensor
+import kit.io as io
+import os
+class PCDataset:
+    def __init__(self, file_path_ls, posQ=4, is_pre_quantized=False):
+        self.files = io.read_point_clouds(file_path_ls)
+        self.posQ = posQ
+        self.is_pre_quantized = is_pre_quantized
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        xyz = torch.tensor(self.files[idx], dtype=torch.float)
+        feats = torch.ones((xyz.shape[0], 1), dtype=torch.float)
+
+        if not self.is_pre_quantized:
+            xyz = xyz / 0.001 
+        xyz = torch.round((xyz + 131072) / self.posQ).int()
+
+        input = SparseTensor(coords=xyz, feats=feats)
+        
+        return {"input": input}
+
+nn.py
+import torch
+import torch.nn as nn
+
+import torchsparse
+from torchsparse import nn as spnn
+from torchsparse import SparseTensor
+import kit.op as op
+
+class ResNet(torch.nn.Module): 
+    """Residual Network
+    """  
+    def __init__(self, channels, k=3):
+        super().__init__()
+        self.conv0 = spnn.Conv3d(channels, channels, k)
+        self.conv1 = spnn.Conv3d(channels, channels, k)
+        self.relu = spnn.ReLU(True)
+
+    def forward(self, x):
+        out = self.relu(self.conv0(x))
+        out = self.conv1(out)
+        out = self.relu(out+x)
+        return out
+
+
+class FOG(torch.nn.Module): 
+    """Fast Occupancy Converter
+    """  
+    def __init__(self):
+        super(FOG, self).__init__()
+
+        self.conv = spnn.Conv3d(1, 1, kernel_size=2, stride=2, bias=False)
+        torch.nn.init.constant_(self.conv.kernel, 1.0)
+        for param in self.conv.parameters():
+            param.requires_grad = False
+
+        self.pos_multiplier = torch.tensor([[1, 2, 4]], device='cuda')
+
+    def pos(self, coords):
+        """Assign codes (i.e., 1, 2, 4, ..., 64, 128) for each coords
+        Input: coords: (N_d, 4)
+        Return: pos: (N_d, 1)
+        """ 
+        pos = (coords[:, 1:] % 2) * self.pos_multiplier # (N_d, 3)
+        pos = pos.sum(dim=-1, keepdim=True) # (N_d, 1)
+        pos = (2 ** pos).float()
+        return pos
+
+    def forward(self, x):
+        '''Dyadic downscaling to generate sparse occupancy code
+        Input: x SparseTensor: x.coords (N_d, 4); x.feats (N_d, 1)
+        Return: ds_x SparseTensor: ds_x.coords (N_{d-1}, 4); ds_x.feats (N_{d-1}, 1) （下采样后的坐标，占据码）
+        ''' 
+        x.feats = self.pos(x.coords) # (N{d-1}, 1)
+        ds_x = self.conv(x) # coordinate = ds_x.C and occupancy = ds_x.F
+        return ds_x
+
+
+class FCG(torch.nn.Module): 
+    """Fast Coordinate Converter
+    """  
+    def __init__(self):
+        super(FCG, self).__init__()
+
+        self.expand_coords_base = torch.tensor([
+            [0, 0, 0], # -> 1 (occupancy adder)
+            [1, 0, 0], # -> 2 (occupancy adder)
+            [0, 1, 0], # -> 4 (occupancy adder)
+            [1, 1, 0], # -> 8 (occupancy adder)
+            [0, 0, 1], # -> 16 (occupancy adder)
+            [1, 0, 1], # -> 32 (occupancy adder)
+            [0, 1, 1], # -> 64 (occupancy adder)
+            [1, 1, 1], # -> 128 (occupancy adder)
+        ], device='cuda')
+
+        self.pos = torch.arange(0, 8, device='cuda').view(1, 8)
+
+    def forward(self, x_C, x_O, x_F=None):
+        '''Upscaling according to coordinates and occupancy code
+        Input: x_C: coordinates (N_d, 4)
+        Input: x_O: occupancy (N_d, 1)
+        Input: x_F: features (N_d, C)
+        Return: x_up_C: upscaled coordinates (N_{d+1}, 4)
+        Return: x_up_F: replicated features (N_{d+1}, C)
+        ''' 
+        # 1 to 8 expand
+        expand_coords = self.expand_coords_base.repeat(x_C.shape[0], 1) # (N_d*8, 4)
+        x_C_repeat = x_C.repeat(1, 8).reshape(-1, 4) # (N_d*8, 4) repeated coords
+        x_C_repeat[:, 1:] = x_C_repeat[:, 1:] * 2 + expand_coords # (N_d*8, 4) expanded coords
+        mask = torch.div(x_O.repeat(1, 8) % (2**(self.pos+1)), 2**self.pos, rounding_mode='floor').reshape(-1) # (N_d*8, 1) mask for pruning
+        mask = (mask == 1) # (N_d*8, 1) mask for pruning
+        x_up_C = x_C_repeat[mask].int() # (N_{d+1}, 4) upscaled coords
+        if x_F is None:
+            return x_up_C
+        else:
+            C = x_F.shape[1]
+            x_F = x_F.repeat(1, 8).reshape(-1, C) # (N_d*8, C)
+            x_up_F = x_F[mask]
+            return x_up_C, x_up_F
+        
+
+class TargetEmbedding(torch.nn.Module): 
+    """Target Embedding
+    """  
+    def __init__(self, channels):
+        super(TargetEmbedding, self).__init__()
+        self.target_res_embedding = nn.Embedding(8, channels)
+
+    def forward(self, x_up_F, x_up_C):
+        '''Embed x.F from x.C to x_up_C
+        Input: x_up_F Feats (N_{d+1}, dim)
+        Input: x_up_C Coords (N_{d+1}, 4)
+        Return x_up SparseTensor (N_{d+1}, dim)
+        ''' 
+        coords_delta = x_up_C[:, 1:] % 2
+        coords_idx = coords_delta[:, 0] + coords_delta[:, 1]*2 + coords_delta[:, 2]*4
+        x_up_F = x_up_F + self.target_res_embedding(coords_idx.int()) # (B*Nt, C)
+        return x_up_F
+
+
