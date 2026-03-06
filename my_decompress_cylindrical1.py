@@ -18,7 +18,7 @@ from my_network_cylindrical import Network
 import kit.io as io
 import kit.op as op
 
-from cylindrical import CylindricalGridCfg, cyl_grid_to_cart
+from cylindrical1 import CylindricalGridCfg, cyl_grid_to_cart
 
 random.seed(1)
 np.random.seed(1)

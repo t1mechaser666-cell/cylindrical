@@ -3,7 +3,7 @@ from torchsparse import SparseTensor
 
 import kit.io as io
 from typing import Optional
-from cylindrical import CylindricalGridCfg, cart_to_cyl_grid
+from cylindrical1 import CylindricalGridCfg, cart_to_cyl_grid
 
 
 class PCDataset:

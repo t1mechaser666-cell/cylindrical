@@ -17,7 +17,7 @@ from torch.cuda.amp import GradScaler, autocast
 from torchsparse.nn import functional as F
 from torchsparse.utils.collate import sparse_collate_fn
 
-from cylindrical_utils import PCDataset
+from cylindrical1_utils import PCDataset
 from my_network_cylindrical import Network
 
 import warnings
@@ -321,11 +321,11 @@ def main():
     parser.add_argument('--posQ', type=float, default=8.0, help='Base quantization step in mm (fallback for all axes)')
     parser.add_argument('--theta_scale_mm', type=float, default=4096.0, help='Scaling factor for theta -> a_mm')
     parser.add_argument('--shift_mm', type=float, default=131072.0, help='Shift for quantization')
-    parser.add_argument('--q_r_mm', type=float, default=None, help='Quantization step for radial axis after optional log mapping')
-    parser.add_argument('--q_a_mm', type=float, default=None, help='Quantization step for angular mapped axis a_mm')
-    parser.add_argument('--q_z_mm', type=float, default=None, help='Quantization step for z axis')
+    parser.add_argument('--q_r_mm', type=float, default=4, help='Quantization step for radial axis after optional log mapping')
+    parser.add_argument('--q_a_mm', type=float, default=2, help='Quantization step for angular mapped axis a_mm')
+    parser.add_argument('--q_z_mm', type=float, default=4, help='Quantization step for z axis')
     parser.add_argument('--use_log_r', type=int, default=1, choices=[0, 1], help='Use logarithmic radial partitioning from paper')
-    parser.add_argument('--log_r_scale_mm', type=float, default=1000.0, help='Scale s in r_enc = log(1 + r/s) * s')
+    parser.add_argument('--log_r_scale_mm', type=float, default=10000.0, help='Scale s in r_enc = log(1 + r/s) * s')
     
     args = parser.parse_args()
 

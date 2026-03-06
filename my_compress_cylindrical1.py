@@ -18,7 +18,7 @@ from my_network_cylindrical import Network
 import kit.io as io
 import kit.op as op
 
-from cylindrical import CylindricalGridCfg, cart_to_cyl_grid
+from cylindrical1 import CylindricalGridCfg, cart_to_cyl_grid
 
 random.seed(1)
 np.random.seed(1)
@@ -45,7 +45,7 @@ parser = argparse.ArgumentParser(
     formatter_class=argparse.ArgumentDefaultsHelpFormatter
 )
 
-parser.add_argument('--input_glob', default='/home/zyn/pccdata/KITTI14999_preprocess/testing/*.ply', help='Glob pattern for input point clouds.')
+parser.add_argument('--input_glob', default='./data/kittidet_examples/*.ply', help='Glob pattern for input point clouds.')
 parser.add_argument('--output_folder', default='./my_test/cy1_KITTI14999_compressed/', help='Folder to save compressed bin files.')
 parser.add_argument("--is_data_pre_quantized", type=bool, default=False, help="Whether the input data is pre quantized.")
 
@@ -55,11 +55,11 @@ parser.add_argument('--posQ', default=8.0, type=float, help='Base quantization s
 # Cylindrical quantization parameters
 parser.add_argument('--theta_scale_mm', type=float, default=4096.0, help='a_mm = theta(rad) * theta_scale_mm.')
 parser.add_argument('--shift_mm', type=float, default=131072.0, help='Shift before quantization.')
-parser.add_argument('--q_r_mm', type=float, default=None, help='Quantization step for radial axis (after optional log mapping).')
-parser.add_argument('--q_a_mm', type=float, default=None, help='Quantization step for angular mapped axis a_mm.')
-parser.add_argument('--q_z_mm', type=float, default=None, help='Quantization step for z axis.')
+parser.add_argument('--q_r_mm', type=float, default=4, help='Quantization step for radial axis (after optional log mapping).')
+parser.add_argument('--q_a_mm', type=float, default=2, help='Quantization step for angular mapped axis a_mm.')
+parser.add_argument('--q_z_mm', type=float, default=4, help='Quantization step for z axis.')
 parser.add_argument('--use_log_r', type=int, default=1, choices=[0, 1], help='Use logarithmic radial partitioning (paper style).')
-parser.add_argument('--log_r_scale_mm', type=float, default=1000.0, help='Scale s in r_enc = log(1 + r/s) * s.')
+parser.add_argument('--log_r_scale_mm', type=float, default=10000.0, help='Scale s in r_enc = log(1 + r/s) * s.')
 
 parser.add_argument('--channels', type=int, help='Neural network channels.', default=32)
 parser.add_argument('--kernel_size', type=int, help='Convolution kernel size.', default=3)
